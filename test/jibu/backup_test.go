@@ -3,6 +3,7 @@ package jibu
 import (
 	"flag"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"math/rand"
 	"strings"
 	"testing"
@@ -84,11 +85,11 @@ var _ = Describe("use jibu api", func() {
 				MyBy("clean up at the end")
 				backupJob, _, err := jibuClient.BackupJobTagApi.GetBackupJob(ctx, tenant, backupJobName)
 				if err == nil {
-					MyBy(fmt.Sprint("backupjob", backupJob))
+					MyBy(spew.Sdump("backupjob", backupJob))
 				}
 				restoreJob, _, err := jibuClient.RestoreJobTagApi.GetRestoreJob(ctx, tenant, restoreJobName)
 				if err == nil {
-					MyBy(fmt.Sprint("restorejob", restoreJob))
+					MyBy(spew.Sdump("restorejob", restoreJob))
 				}
 				_, _, _ = jibuClient.BackupJobTagApi.DeleteBackupJob(ctx, tenant, backupJobName)
 				_, _, _ = jibuClient.RestoreJobTagApi.DeleteRestoreJob(ctx, tenant, restoreJobName)
