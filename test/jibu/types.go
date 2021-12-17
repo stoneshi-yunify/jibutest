@@ -27,3 +27,29 @@ const (
 	// JobSubmitted means a job is submitted to backend controller
 	JobPhaseSubmitted PhaseType = "JobSubmitted"
 )
+
+type BackupCopyMethod string
+
+const (
+	BackupCopyMethodFilesystem BackupCopyMethod = "filesystem"
+	BackupCopyMethodSnapshot   BackupCopyMethod = "snapshot"
+)
+
+const (
+	FieldName                = "name"
+	FieldNames               = "names"
+	FieldUID                 = "uid"
+	FieldCreationTimeStamp   = "creationTimestamp"
+	FieldCreateTime          = "createTime"
+	FieldLastUpdateTimestamp = "lastUpdateTimestamp"
+	FieldUpdateTime          = "updateTime"
+	FieldLabel               = "label"
+	FieldAnnotation          = "annotation"
+	FieldNamespace           = "namespace"
+	FieldStatus              = "status"
+	FieldOwnerReference      = "ownerReference"
+	FieldOwnerKind           = "ownerKind"
+	FieldDeletionTimestamp   = "deletionTimestamp"
+
+	FieldType = "type"
+)
