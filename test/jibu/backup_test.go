@@ -3,11 +3,16 @@ package jibu
 import (
 	"flag"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
 	"math/rand"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/antihax/optional"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/robfig/cron/v3"
 
 	"github.com/elliotchance/pie/pie"
 
@@ -34,12 +39,19 @@ var _ = Describe("use jibu api", func() {
 	flag.VisitAll(func(f *flag.Flag) {
 		MyBy(fmt.Sprintf("%s = %v", f.Name, f.Value))
 	})
+	if err := validateFlags(); err != nil {
+		panic(err.Error())
+	}
 
 	tenant := *argTenant
 	jibuAPIEndpoint := *argJibuAPIEndpoint
 	excludeNamespaces := pie.Strings(strings.Split(*argExcludeNamespaces, ","))
 	restoreToSameNamespace := *argRestoreToSameNamespace
+	backupRepeatEnabled := *argBackupRepeatEnabled
+	backupRepeatCheckNum := *argBackupRepeatCheckNum
+	backupFrequency := *argBackupFrequency
 	backupWithPV := *argBackupWithPV
+	backupCopyMethod := *argBackupCopyMethod
 	backupNamespace := *argBackupNamespace
 	restoreNamespace := *argRestoreNamespace
 	skipBackup := *argSkipBackup
@@ -75,7 +87,7 @@ var _ = Describe("use jibu api", func() {
 		BeforeEach(func() {
 			MyBy("clean up at the beginning")
 			_, _, _ = jibuClient.BackupPlanTagApi.DeleteBackupPlan(ctx, tenant, backupPlanName)
-			_, _, _ = jibuClient.BackupJobTagApi.DeleteBackupJob(ctx, tenant, backupJobName)
+			_ = deleteJobsOfBackupPlan(jibuClient, tenant, backupPlanName)
 			_, _, _ = jibuClient.RestorePlanTagApi.DeleteRestorePlan(ctx, tenant, restorePlanName)
 			_, _, _ = jibuClient.RestoreJobTagApi.DeleteRestoreJob(ctx, tenant, restoreJobName)
 		})
@@ -83,15 +95,21 @@ var _ = Describe("use jibu api", func() {
 		AfterEach(func() {
 			if cleanUpOnEnd {
 				MyBy("clean up at the end")
-				backupJob, _, err := jibuClient.BackupJobTagApi.GetBackupJob(ctx, tenant, backupJobName)
-				if err == nil {
-					MyBy(spew.Sdump("backupjob", backupJob))
+				// we only clean up the backup plan when it's repeated
+				// because on-demand plan won't generate new jobs after the test finishes
+				if backupRepeatEnabled {
+					backupPlan, _, err := jibuClient.BackupPlanTagApi.GetBackupPlan(ctx, tenant, backupPlanName)
+					if err == nil {
+						MyBy(spew.Sdump("backup plan", backupPlan))
+					}
+					_, _, _ = jibuClient.BackupPlanTagApi.DeleteBackupPlan(ctx, tenant, backupPlanName)
 				}
+				_ = deleteJobsOfBackupPlan(jibuClient, tenant, backupPlanName)
 				restoreJob, _, err := jibuClient.RestoreJobTagApi.GetRestoreJob(ctx, tenant, restoreJobName)
 				if err == nil {
 					MyBy(spew.Sdump("restorejob", restoreJob))
 				}
-				_, _, _ = jibuClient.BackupJobTagApi.DeleteBackupJob(ctx, tenant, backupJobName)
+				// _, _, _ = jibuClient.RestorePlanTagApi.DeleteRestorePlan(ctx, tenant, restorePlanName)
 				_, _, _ = jibuClient.RestoreJobTagApi.DeleteRestoreJob(ctx, tenant, restoreJobName)
 				if backupNamespace != restoreNamespace || backupCluster != restoreCluster {
 					if len(backupCluster) != 0 && len(restoreNamespace) != 0 {
@@ -128,9 +146,12 @@ var _ = Describe("use jibu api", func() {
 				}
 				backupPolicy := swagger.V1alpha1BackupPolicy{
 					Retention: jobRetention,
+					Repeat:    backupRepeatEnabled,
+					Frequency: backupFrequency,
 				}
 				backupPlanSpec := swagger.V1alpha1BackupPlanSpec{
 					ClusterName: backupCluster,
+					CopyMethod:  backupCopyMethod,
 					Desc:        backupPlanName,
 					DisplayName: backupPlanName,
 					ExcludePV:   !backupWithPV,
@@ -147,32 +168,69 @@ var _ = Describe("use jibu api", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				MyBy(fmt.Sprintf("backup plan %s created", backupPlan.Metadata.Name))
 
-				MyBy("create a backup job")
-				meta = swagger.V1ObjectMeta{
-					Name: backupJobName,
-				}
-				backupJobSpec := swagger.V1alpha1BackupJobSpec{
-					Action:      actionStartJob,
-					BackupName:  backupPlanName,
-					Desc:        backupJobName,
-					DisplayName: backupJobName,
-					Tenant:      tenant,
-				}
-				backupJob := swagger.V1alpha1BackupJob{
-					Metadata: &meta,
-					Spec:     &backupJobSpec,
-				}
-				_, _, err = jibuClient.BackupJobTagApi.CreateBackupJob(ctx, tenant, backupJob)
-				Expect(err).ShouldNot(HaveOccurred())
-				MyBy(fmt.Sprintf("backup job %s created", backupJobName))
-
 				MyBy(fmt.Sprintf("backup plan should be ready in %v", backupPlanReadyTimeout))
 				waitBackupPlanReady(jibuClient, tenant, backupPlanName)
 				MyBy("back plan is ready now")
 
-				MyBy(fmt.Sprintf("backup job should complete in %v", backupJobFinishedTimeout))
-				waitBackupJobComplete(jibuClient, tenant, backupJobName)
-				MyBy("backup job succeeded")
+				if !backupRepeatEnabled {
+					MyBy("create a backup job")
+					meta = swagger.V1ObjectMeta{
+						Name: backupJobName,
+					}
+					backupJobSpec := swagger.V1alpha1BackupJobSpec{
+						Action:      actionStartJob,
+						BackupName:  backupPlanName,
+						Desc:        backupJobName,
+						DisplayName: backupJobName,
+						Tenant:      tenant,
+					}
+					backupJob := swagger.V1alpha1BackupJob{
+						Metadata: &meta,
+						Spec:     &backupJobSpec,
+					}
+					_, _, err = jibuClient.BackupJobTagApi.CreateBackupJob(ctx, tenant, backupJob)
+					Expect(err).ShouldNot(HaveOccurred())
+					MyBy(fmt.Sprintf("backup job %s created", backupJobName))
+
+					MyBy(fmt.Sprintf("backup job should complete in %v", backupJobFinishedTimeout))
+					waitBackupJobComplete(jibuClient, tenant, backupJobName)
+					MyBy("backup job succeeded")
+				} else {
+					MyBy("wait for repeated creation of backup jobs")
+
+					// indexChan dispatches the index of each backup job
+					// sorted by creation time
+					// which is retrieved and used by each cronjob execution
+					// to find out which job they should be waiting for
+					indexChan := make(chan int, backupRepeatCheckNum)
+					wg := sync.WaitGroup{}
+					checkRepeatedBackupJob := func() {
+						var index int
+						select {
+						case index = <-indexChan:
+							defer wg.Done()
+						// the last job has not completed yet
+						// postpone the check to the next cron scedule
+						default:
+							return
+						}
+						MyBy(fmt.Sprintf("wait for backup job to be created in %v, index: %d", backupJobRepeatedCreationTimeout, index))
+						jobName := waitNthBackupJobCreation(jibuClient, tenant, backupPlanName, index)
+						MyBy(fmt.Sprintf("backup job created, index: %d, name: %s", index, jobName))
+						MyBy(fmt.Sprintf("backup job should complete in %v, index: %d, name: %s", backupJobFinishedTimeout, index, jobName))
+						waitBackupJobComplete(jibuClient, tenant, jobName)
+						MyBy(fmt.Sprintf("backup job completed, index: %d, name: %s", index, jobName))
+					}
+					c := cron.New()
+					c.AddFunc(backupFrequency, checkRepeatedBackupJob)
+					c.Start()
+					for i := 0; i < backupRepeatCheckNum; i++ {
+						indexChan <- i
+						wg.Add(1)
+						wg.Wait()
+					}
+					c.Stop()
+				}
 			}
 
 			if !skipRestore {
@@ -211,9 +269,11 @@ var _ = Describe("use jibu api", func() {
 				meta = swagger.V1ObjectMeta{
 					Name: restoreJobName,
 				}
+				backupJobToRestore, err := pickOneJobOfBackupPlan(jibuClient, tenant, backupPlanName)
+				Expect(err).ShouldNot(HaveOccurred())
 				restoreJobSpec := swagger.V1alpha1RestoreJobSpec{
 					Action:        actionStartJob,
-					BackupJobName: backupJobName,
+					BackupJobName: backupJobToRestore.Metadata.Name,
 					Desc:          restoreJobName,
 					DisplayName:   restoreJobName,
 					RestoreName:   restorePlanName,
@@ -243,7 +303,7 @@ func pickOneCluster(jibuClient *swagger.APIClient, tenant string, cluster string
 	var c *swagger.V1alpha1Cluster
 
 	if cluster != "" {
-		c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster)
+		c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &swagger.ClusterApiGetClusterOpts{})
 		Expect(err).ShouldNot(HaveOccurred())
 		return &c
 	}
@@ -332,6 +392,22 @@ func pickOneNamespace(jibuClient *swagger.APIClient, tenant string, cluster stri
 	}
 	Expect(ns).ShouldNot(BeNil())
 	return ns
+}
+
+func pickOneJobOfBackupPlan(jibuClient *swagger.APIClient, tenant string, planName string) (*swagger.V1alpha1BackupJob, error) {
+	listOpts := &swagger.BackupJobTagApiListBackupJobsOpts{
+		PlanName:  optional.NewString(planName),
+		SortBy:    optional.NewString(FieldCreationTimeStamp),
+		Ascending: optional.NewString(strconv.FormatBool(true)),
+	}
+	jobList, _, err := jibuClient.BackupJobTagApi.ListBackupJobs(ctx, tenant, listOpts)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobList.Items) <= 0 {
+		return nil, fmt.Errorf("no backup job found")
+	}
+	return &jobList.Items[0], nil
 }
 
 func determineDestNamespaceName(restoreToSameNamespace bool, backupNamespaceName string) string {
@@ -424,7 +500,7 @@ func waitRestoreJobComplete(jibuClient *swagger.APIClient, tenant string, restor
 
 func getK8sClientFromCluster(jibuClient *swagger.APIClient, tenant string, cluster string) *kubernetes.Clientset {
 	// TODO cluster's kubeconfig has been striped, need jibu provide new api
-	c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster)
+	c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &swagger.ClusterApiGetClusterOpts{})
 	Expect(err).ShouldNot(HaveOccurred())
 	kubeconfigBytes := []byte(c.Spec.Kubeconfig)
 	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfigBytes)
@@ -439,4 +515,46 @@ func getK8sClientFromCluster(jibuClient *swagger.APIClient, tenant string, clust
 func deleteNamespace(k8sClient *kubernetes.Clientset, namespace string) {
 	err := k8sClient.CoreV1().Namespaces().Delete(ctx, namespace, v1.DeleteOptions{})
 	Expect(err).ShouldNot(HaveOccurred())
+}
+
+func deleteJobsOfBackupPlan(jibuClient *swagger.APIClient, tenant string, planName string) error {
+	listOpts := &swagger.BackupJobTagApiListBackupJobsOpts{
+		PlanName: optional.NewString(planName),
+	}
+	var retErr error
+	jobList, _, err := jibuClient.BackupJobTagApi.ListBackupJobs(ctx, tenant, listOpts)
+	if err != nil {
+		retErr = err
+	} else {
+		for _, j := range jobList.Items {
+			_, _, err = jibuClient.BackupJobTagApi.DeleteBackupJob(ctx, tenant, j.Metadata.Name)
+			if err != nil {
+				retErr = err
+			}
+		}
+	}
+	return retErr
+}
+
+func waitNthBackupJobCreation(jibuClient *swagger.APIClient, tenant string, planName string, index int) string {
+	var jobName string
+	listOpts := &swagger.BackupJobTagApiListBackupJobsOpts{
+		PlanName:  optional.NewString(planName),
+		SortBy:    optional.NewString(FieldCreationTimeStamp),
+		Ascending: optional.NewString(strconv.FormatBool(true)),
+	}
+	nthJobCreatedFunc := func() (bool, error) {
+		jobList, _, err := jibuClient.BackupJobTagApi.ListBackupJobs(ctx, tenant, listOpts)
+		if err != nil {
+			return false, err
+		}
+		if len(jobList.Items) < index+1 {
+			return false, nil
+		}
+		jobName = jobList.Items[index].Metadata.Name
+		return true, nil
+	}
+	err := wait.Poll(5*time.Second, backupJobRepeatedCreationTimeout, nthJobCreatedFunc)
+	Expect(err).ShouldNot(HaveOccurred())
+	return jobName
 }
