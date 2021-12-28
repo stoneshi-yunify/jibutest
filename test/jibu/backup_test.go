@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antihax/optional"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/robfig/cron/v3"
 
 	"github.com/elliotchance/pie/pie"
@@ -231,7 +229,8 @@ var _ = Describe("use jibu api", func() {
 						MyBy(fmt.Sprintf("backup job completed, index: %d, name: %s", index, jobName))
 					}
 					c := cron.New()
-					c.AddFunc(backupFrequency, checkRepeatedBackupJob)
+					_, err = c.AddFunc(backupFrequency, checkRepeatedBackupJob)
+					Expect(err).ShouldNot(HaveOccurred())
 					c.Start()
 					for i := 0; i < backupRepeatCheckNum; i++ {
 						indexChan <- i
