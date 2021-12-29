@@ -3,6 +3,11 @@ package jibu
 import (
 	"flag"
 	"fmt"
+	"github.com/antihax/optional"
+	"github.com/davecgh/go-spew/spew"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -10,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/antihax/optional"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/robfig/cron/v3"
 
 	"github.com/elliotchance/pie/pie"
@@ -113,8 +116,12 @@ var _ = Describe("use jibu api", func() {
 				_, _, _ = jibuClient.RestoreJobTagApi.DeleteRestoreJob(ctx, tenant, restoreJobName)
 				if backupNamespace != restoreNamespace || backupCluster != restoreCluster {
 					if len(backupCluster) != 0 && len(restoreNamespace) != 0 {
-						// k8sClient := getK8sClientFromCluster(jibuClient, restoreClusterID)
-						// deleteNamespace(k8sClient, restoredNamespace)
+						MyBy(fmt.Sprintf("delete namespace %s", restoreNamespace))
+						k8sClient, dynamicClient := getK8sClientFromCluster(jibuClient, tenant, restoreCluster)
+						err = deleteNamespace(k8sClient, dynamicClient, restoreNamespace, true)
+						if err != nil {
+							MyBy(fmt.Sprintf("failed to delete namespace %s, error: %v", restoreNamespace, err))
+						}
 					}
 				}
 			}
@@ -222,7 +229,8 @@ var _ = Describe("use jibu api", func() {
 						MyBy(fmt.Sprintf("backup job completed, index: %d, name: %s", index, jobName))
 					}
 					c := cron.New()
-					c.AddFunc(backupFrequency, checkRepeatedBackupJob)
+					_, err = c.AddFunc(backupFrequency, checkRepeatedBackupJob)
+					Expect(err).ShouldNot(HaveOccurred())
 					c.Start()
 					for i := 0; i < backupRepeatCheckNum; i++ {
 						indexChan <- i
@@ -303,7 +311,8 @@ func pickOneCluster(jibuClient *swagger.APIClient, tenant string, cluster string
 	var c *swagger.V1alpha1Cluster
 
 	if cluster != "" {
-		c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &swagger.ClusterApiGetClusterOpts{})
+		opts := swagger.ClusterApiGetClusterOpts{IncludeKubeconfig: optional.NewString("false")}
+		c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &opts)
 		Expect(err).ShouldNot(HaveOccurred())
 		return &c
 	}
@@ -333,7 +342,8 @@ func pickOneStorage(jibuClient *swagger.APIClient, tenant string, storage string
 	var s *swagger.V1alpha1Storage
 
 	if storage != "" {
-		s, _, err := jibuClient.StorageApi.GetStorage(ctx, tenant, storage)
+		opts := swagger.StorageApiGetStorageOpts{IncludeSecrets: optional.NewString("false")}
+		s, _, err := jibuClient.StorageApi.GetStorage(ctx, tenant, storage, &opts)
 		Expect(err).ShouldNot(HaveOccurred())
 		return &s
 	}
@@ -498,9 +508,9 @@ func waitRestoreJobComplete(jibuClient *swagger.APIClient, tenant string, restor
 	Expect(restoreJobCreated.Status.Phase).Should(Equal(string(JobPhaseCompleted)))
 }
 
-func getK8sClientFromCluster(jibuClient *swagger.APIClient, tenant string, cluster string) *kubernetes.Clientset {
-	// TODO cluster's kubeconfig has been striped, need jibu provide new api
-	c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &swagger.ClusterApiGetClusterOpts{})
+func getK8sClientFromCluster(jibuClient *swagger.APIClient, tenant string, cluster string) (kubernetes.Interface, dynamic.Interface) {
+	opts := swagger.ClusterApiGetClusterOpts{IncludeKubeconfig: optional.NewString("true")}
+	c, _, err := jibuClient.ClusterApi.GetCluster(ctx, tenant, cluster, &opts)
 	Expect(err).ShouldNot(HaveOccurred())
 	kubeconfigBytes := []byte(c.Spec.Kubeconfig)
 	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfigBytes)
@@ -509,12 +519,86 @@ func getK8sClientFromCluster(jibuClient *swagger.APIClient, tenant string, clust
 	Expect(err).ShouldNot(HaveOccurred())
 	kubeClient, err := kubernetes.NewForConfig(restClient)
 	Expect(err).ShouldNot(HaveOccurred())
-	return kubeClient
+	dynamicClient, err := dynamic.NewForConfig(restClient)
+	Expect(err).ShouldNot(HaveOccurred())
+	return kubeClient, dynamicClient
 }
 
-func deleteNamespace(k8sClient *kubernetes.Clientset, namespace string) {
-	err := k8sClient.CoreV1().Namespaces().Delete(ctx, namespace, v1.DeleteOptions{})
-	Expect(err).ShouldNot(HaveOccurred())
+func deleteNamespace(kubeClient kubernetes.Interface, dynamicClient dynamic.Interface, namespace string, force bool) error {
+	err := kubeClient.CoreV1().Namespaces().Delete(ctx, namespace, v1.DeleteOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if !force {
+		return nil
+	}
+
+	namespaceGoneCheckFunc := func() (bool, error) {
+		_, err = kubeClient.CoreV1().Namespaces().Get(ctx, namespace, v1.GetOptions{})
+		if err != nil && errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	_ = wait.Poll(5*time.Second, 2*time.Minute, namespaceGoneCheckFunc)
+
+	_, err = kubeClient.CoreV1().Namespaces().Get(ctx, namespace, v1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	gracePeriod := int64(0)
+	_ = kubeClient.CoreV1().Namespaces().Delete(ctx, namespace, v1.DeleteOptions{GracePeriodSeconds: &gracePeriod})
+	_ = wait.Poll(5*time.Second, 2*time.Minute, namespaceGoneCheckFunc)
+
+	_, err = kubeClient.CoreV1().Namespaces().Get(ctx, namespace, v1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	resourceLists, err := kubeClient.Discovery().ServerPreferredNamespacedResources()
+	for _, resourceList := range resourceLists {
+		for _, resource := range resourceList.APIResources {
+			gv := resourceList.GroupVersion
+			groupVersion, err := schema.ParseGroupVersion(gv)
+			if err != nil {
+				return err
+			}
+			gvr := schema.GroupVersionResource{
+				Group:    groupVersion.Group,
+				Version:  groupVersion.Version,
+				Resource: resource.Name,
+			}
+			unstructuredList, err := dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, v1.ListOptions{})
+			if err != nil {
+				continue
+			}
+			for _, unstructured := range unstructuredList.Items {
+				_ = dynamicClient.Resource(gvr).Namespace(namespace).Delete(ctx, unstructured.GetName(), v1.DeleteOptions{GracePeriodSeconds: &gracePeriod})
+				unstructured.SetFinalizers(nil)
+				_, _ = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, &unstructured, v1.UpdateOptions{FieldValidation: v1.FieldValidationIgnore})
+			}
+		}
+	}
+
+	_, err = kubeClient.CoreV1().Namespaces().Get(ctx, namespace, v1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func deleteJobsOfBackupPlan(jibuClient *swagger.APIClient, tenant string, planName string) error {
